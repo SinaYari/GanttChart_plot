@@ -1,0 +1,537 @@
+
+"""
+Gantt chart generator for a partitioned real-time scheduling trace.
+
+Reads a trace CSV (as exported from the task-set / attack-window generator)
+that contains:
+  - A TASK_INPUT_CONFIGURATION block mapping task_id -> type
+    (ANTERIOR / POSTERIOR / MALICIOUS / NEUTRAL)
+  - A TIME,CORE_0[,CORE_1,...] block giving, for every time unit of the
+    hyperperiod, which job is running on each core (or IDLE)
+
+and draws a per-core Gantt chart, color-coding each task's execution
+according to its type:
+
+    ANTERIOR   -> blue
+    MALICIOUS  -> red
+    POSTERIOR  -> green
+    NEUTRAL    -> gray
+    IDLE       -> white (with a light hatch so it's visible but muted)
+
+Usage:
+    python plot_gantt.py gantt_trace.csv gantt_chart.png
+"""
+
+import sys
+import csv
+import re
+from collections import defaultdict
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+
+
+COLOR_MAP = {
+    "ANTERIOR": "#1f77b4",   # blue
+    "MALICIOUS": "#d62728",  # red
+    "POSTERIOR": "#2ca02c",  # green
+    "NEUTRAL": "#7f7f7f",    # gray
+    "IDLE": "#f2f2f2",       # near-white
+}
+
+
+def parse_trace(csv_path):
+    """Parse the trace file and return:
+       task_type      : dict {task_id (str) -> type string}
+       task_period    : dict {task_id (str) -> period (float)}
+       task_aew_value : dict {task_id (str) -> aew_value (float)}, only for
+                        tasks that have a TASK_AEW row (Anterior/Posterior)
+       core_names     : list of core column names, e.g. ['CORE_0']
+       schedule       : dict {core_name -> list of (time_slot, label)}
+       attack_events  : list of dicts, one per ATTACK_EVENTS row (only the
+                        jobs that were actually attacked -- kept for
+                        reference, but AEW windows are now computed for
+                        EVERY Anterior/Posterior job from the schedule,
+                        whether or not it appears here).
+    """
+    task_type = {}
+    task_period = {}
+    task_aew_value = {}
+    core_names = []
+    schedule = defaultdict(list)
+    attack_events = []
+
+    with open(csv_path, newline="") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    in_trace_block = False
+    in_attack_events = False
+    attack_header = None
+
+    for row in rows:
+        if not row:
+            continue
+
+        # --- Task type/period configuration lines ---
+        # TASK_INPUT,<task_id>,<period>,<wcet>,<input_utilization>,<type>
+        if row[0] == "TASK_INPUT" and len(row) >= 6:
+            task_id = row[1].strip()
+            ttype = row[-1].strip().upper()
+            task_type[task_id] = ttype
+            try:
+                task_period[task_id] = float(row[2].strip())
+            except ValueError:
+                pass
+            continue
+
+        # --- Per-task AEW configuration lines ---
+        # TASK_AEW,<task_id>,<type>,<aew_percentage>,<aew_value>
+        if row[0] == "TASK_AEW" and len(row) >= 5:
+            task_id = row[1].strip()
+            try:
+                task_aew_value[task_id] = float(row[4].strip())
+            except ValueError:
+                pass
+            continue
+
+        # --- Start of the time/core trace block ---
+        if row[0] == "TIME" and any(c.startswith("CORE_") for c in row[1:]):
+            core_names = [c.strip() for c in row[1:]]
+            in_trace_block = True
+            continue
+
+        # --- Trace data rows: "0,T1_J1" / "0,T1_J1,IDLE" (multi-core) ---
+        if in_trace_block:
+            if row[0].strip().lstrip("-").isdigit():
+                t = int(row[0].strip())
+                for i, core in enumerate(core_names):
+                    label = row[i + 1].strip() if i + 1 < len(row) else "IDLE"
+                    schedule[core].append((t, label))
+                continue
+            else:
+                # Reached a non-numeric line -> trace block has ended
+                in_trace_block = False
+
+        # --- Start of the ATTACK_EVENTS block ---
+        if row[0] == "ATTACK_EVENTS":
+            in_attack_events = True
+            attack_header = None
+            continue
+
+        if in_attack_events:
+            if attack_header is None:
+                # This is the column-name row:
+                # TYPE,VICTIM_TASK,VICTIM_JOB,MALICIOUS_TASK,MALICIOUS_JOB,
+                # MALICIOUS_CORE,DETECTED_AT,WINDOW_START,WINDOW_END
+                attack_header = [c.strip().upper() for c in row]
+                continue
+
+            if row[0].strip().upper() in ("ANTERIOR", "POSTERIOR"):
+                vals = dict(zip(attack_header, [c.strip() for c in row]))
+                attack_events.append({
+                    "type": vals.get("TYPE", "").upper(),
+                    "victim_task": vals.get("VICTIM_TASK"),
+                    "victim_job": vals.get("VICTIM_JOB"),
+                    "malicious_task": vals.get("MALICIOUS_TASK"),
+                    "malicious_job": vals.get("MALICIOUS_JOB"),
+                    "malicious_core": vals.get("MALICIOUS_CORE"),
+                    "detected_at": float(vals.get("DETECTED_AT", 0)),
+                    "window_start": float(vals.get("WINDOW_START", 0)),
+                    "window_end": float(vals.get("WINDOW_END", 0)),
+                })
+                continue
+            else:
+                # Non-matching row -> ATTACK_EVENTS block has ended
+                in_attack_events = False
+
+    return task_type, task_period, task_aew_value, core_names, schedule, attack_events
+
+
+def label_to_task_id(label):
+    """Extract the numeric task id from a job label like 'T3_J2' -> '3'."""
+    m = re.match(r"T(\d+)_J\d+", label)
+    if m:
+        return m.group(1)
+    return None
+
+
+def build_intervals(core_slots):
+    """Collapse a list of (time_slot, label) into contiguous
+    (start, end, label) execution intervals. Each time slot is assumed
+    to represent one unit of time, running from t to t+1."""
+    core_slots = sorted(core_slots, key=lambda x: x[0])
+    intervals = []
+    if not core_slots:
+        return intervals
+
+    cur_label = core_slots[0][1]
+    cur_start = core_slots[0][0]
+    prev_t = core_slots[0][0]
+
+    for t, label in core_slots[1:]:
+        contiguous = (t == prev_t + 1)
+        if label == cur_label and contiguous:
+            prev_t = t
+            continue
+        # close off previous interval
+        intervals.append((cur_start, prev_t + 1, cur_label))
+        cur_label = label
+        cur_start = t
+        prev_t = t
+
+    intervals.append((cur_start, prev_t + 1, cur_label))
+    return intervals
+
+
+AEW_LINE_COLOR = {
+    "ANTERIOR": "#08306b",   # dark navy (contrasts with the blue bars)
+    "POSTERIOR": "#00441b",  # dark green (contrasts with the green bars)
+}
+
+
+def find_job_row(core_names, schedule, task_id, job_id):
+    """Return the core name (row) on which T{task_id}_J{job_id} executes,
+    or None if it never appears in the schedule."""
+    target = f"T{task_id}_J{job_id}"
+    for core in core_names:
+        for _, label in schedule[core]:
+            if label == target:
+                return core
+    return None
+
+
+def compute_job_extents(core_names, schedule):
+    """Return dict {(task_id, job_id) -> (first_start, last_end)} giving the
+    earliest start and latest end (in time units) of every job's execution,
+    scanning across all cores and all (possibly non-contiguous, if the job
+    was preempted and resumed) execution slots."""
+    extents = {}
+    for core in core_names:
+        for t, label in schedule[core]:
+            if label == "IDLE":
+                continue
+            tid = label_to_task_id(label)
+            m = re.match(r"T\d+_J(\d+)", label)
+            if tid is None or m is None:
+                continue
+            job_id = m.group(1)
+            key = (tid, job_id)
+            start, end = extents.get(key, (t, t + 1))
+            extents[key] = (min(start, t), max(end, t + 1))
+    return extents
+
+
+def build_aew_windows(task_type, task_period, task_aew_value, core_names, schedule):
+    """Compute an AEW window for every job of every Anterior/Posterior task,
+    directly from that job's actual execution extent in the schedule --
+    regardless of whether it was actually attacked (i.e. regardless of
+    what's listed in ATTACK_EVENTS).
+
+      ANTERIOR AEW:  runs backward from the job's start.
+                     window = [job_start - aew_value, job_start]
+                     clipped so it never starts before the job's release.
+      POSTERIOR AEW: runs forward from the job's end.
+                     window = [job_end, job_end + aew_value]
+                     clipped so it never ends after the job's deadline
+                     (deadline = release + period, implicit deadline).
+
+    Returns a list of dicts with keys: type, victim_task, victim_job,
+    draw_start, draw_end -- the same shape the drawing code expects.
+    """
+    extents = compute_job_extents(core_names, schedule)
+    windows = []
+
+    for (task_id, job_id), (first_start, last_end) in extents.items():
+        ttype = task_type.get(task_id)
+        if ttype not in ("ANTERIOR", "POSTERIOR"):
+            continue
+
+        aew_value = task_aew_value.get(task_id)
+        if aew_value is None:
+            continue
+
+        period = task_period.get(task_id)
+        release = None
+        deadline = None
+        if period is not None:
+            release = (int(job_id) - 1) * period
+            deadline = release + period
+
+        if ttype == "ANTERIOR":
+            w_start = first_start - aew_value
+            w_end = first_start
+            if release is not None:
+                w_start = max(w_start, release)
+        else:  # POSTERIOR
+            w_start = last_end
+            w_end = last_end + aew_value
+            if deadline is not None:
+                w_end = min(w_end, deadline)
+
+        windows.append({
+            "type": ttype,
+            "victim_task": task_id,
+            "victim_job": job_id,
+            "draw_start": w_start,
+            "draw_end": w_end,
+        })
+
+    return windows
+
+
+def compute_aew_levels(core_names, schedule, attack_events):
+    """Assign each attack event a (core, level) so that overlapping AEW
+    windows on the same core are stacked at increasing heights instead of
+    colliding. Returns dict: id(event) -> (core, level), and max_level."""
+    placed_by_core = defaultdict(list)  # core -> list of (start, end, level)
+    event_info = {}
+    max_level = 0
+
+    for ev in sorted(attack_events, key=lambda e: e["draw_start"]):
+        core = find_job_row(core_names, schedule, ev["victim_task"], ev["victim_job"])
+        if core is None:
+            continue
+        w_start, w_end = ev["draw_start"], ev["draw_end"]
+
+        level = 0
+        while any(not (w_end <= s or w_start >= e)
+                  for (s, e, lv) in placed_by_core[core] if lv == level):
+            level += 1
+        placed_by_core[core].append((w_start, w_end, level))
+        event_info[id(ev)] = (core, level)
+        max_level = max(max_level, level)
+
+    return event_info, max_level
+
+
+def plot_gantt(task_type, task_period, task_aew_value, core_names, schedule,
+               attack_events, out_path):
+    aew_windows = build_aew_windows(task_type, task_period, task_aew_value,
+                                     core_names, schedule)
+    event_info, max_aew_level = compute_aew_levels(core_names, schedule, aew_windows)
+
+    # One lane per task (sorted by task id) for the period-release markers,
+    # drawn BELOW the main Gantt rows.
+    task_ids_sorted = sorted(task_period.keys(), key=lambda k: int(k))
+    PERIOD_LANE_HEIGHT = 4.5
+    n_period_lanes = len(task_ids_sorted)
+    period_area_height = n_period_lanes * PERIOD_LANE_HEIGHT + 2  # + top margin
+
+    fig, ax = plt.subplots(
+        figsize=(14, 1.6 * max(len(core_names), 1) + 1.5 + n_period_lanes * 0.4)
+    )
+
+    yticks = []
+    ylabels = []
+    row_y = {}  # core name -> its base y coordinate
+
+    max_time = 0
+
+    # extra headroom above each bar for the AEW bracket/label; grows if
+    # multiple AEW windows on the same row need to be stacked
+    ROW_HEIGHT = 13 + max_aew_level * 1.8
+
+    # shift every core row up by the space reserved for period lanes at the
+    # bottom of the axes
+    Y_OFFSET = period_area_height
+
+    for row_idx, core in enumerate(core_names):
+        intervals = build_intervals(schedule[core])
+        y = row_idx * ROW_HEIGHT + Y_OFFSET
+        row_y[core] = y
+        yticks.append(y + 4)
+        ylabels.append(core)
+
+        for start, end, label in intervals:
+            duration = end - start
+            max_time = max(max_time, end)
+
+            if label == "IDLE":
+                color = COLOR_MAP["IDLE"]
+                edgecolor = "#999999"
+                hatch = "//"
+            else:
+                tid = label_to_task_id(label)
+                ttype = task_type.get(tid, "NEUTRAL")
+                color = COLOR_MAP.get(ttype, COLOR_MAP["NEUTRAL"])
+                edgecolor = "black"
+                hatch = None
+
+            ax.broken_barh(
+                [(start, duration)],
+                (y, 8),
+                facecolors=color,
+                edgecolors=edgecolor,
+                linewidth=0.8,
+                hatch=hatch,
+            )
+
+            # Label each block with the job name (skip IDLE, and skip if too
+            # narrow to avoid clutter)
+            if label != "IDLE" and duration >= 1:
+                ax.text(
+                    start + duration / 2,
+                    y + 4,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color="white" if label != "IDLE" else "black",
+                    fontweight="bold",
+                )
+
+    # --- Draw AEW (Attack-Exposure Window) brackets ---
+    # Anterior AEW: runs backward from the start of the victim job
+    #   (window_start = job_start - aew_size, window_end = job_start).
+    # Posterior AEW: runs forward from the end of the victim job
+    #   (window_start = job_end, window_end = job_end + aew_size).
+    # Drawn as a dashed horizontal line with small vertical end-caps just
+    # above the job's execution bar, on the same row/core as the job.
+    for ev in aew_windows:
+        info = event_info.get(id(ev))
+        if info is None:
+            continue
+        core, level = info
+
+        w_start, w_end = ev["draw_start"], ev["draw_end"]
+        y_base = row_y[core]
+        y_line = y_base + 9.6 + level * 1.8   # stack upward if overlapping
+        cap = 0.7
+
+        color = AEW_LINE_COLOR.get(ev["type"], "black")
+
+        ax.plot([w_start, w_end], [y_line, y_line],
+                color=color, linestyle="--", linewidth=1.6, zorder=5)
+        ax.plot([w_start, w_start], [y_line - cap, y_line + cap],
+                color=color, linewidth=1.6, zorder=5)
+        ax.plot([w_end, w_end], [y_line - cap, y_line + cap],
+                color=color, linewidth=1.6, zorder=5)
+
+        ax.text(
+            (w_start + w_end) / 2, y_line + 0.8,
+            f"AEW T{ev['victim_task']}J{ev['victim_job']}",
+            ha="center", va="bottom", fontsize=5.5, color=color,
+        )
+
+    # --- Draw task PERIOD release markers (below the Gantt rows) ---
+    # For each task, a thin baseline spans the timeline; a bold black
+    # downward arrow marks every ideal release instant (0, T, 2T, 3T, ...).
+    TASK_LABEL_COLOR = {
+        "ANTERIOR": COLOR_MAP["ANTERIOR"],
+        "MALICIOUS": COLOR_MAP["MALICIOUS"],
+        "POSTERIOR": COLOR_MAP["POSTERIOR"],
+        "NEUTRAL": COLOR_MAP["NEUTRAL"],
+    }
+
+    for lane_idx, tid in enumerate(task_ids_sorted):
+        period = task_period[tid]
+        lane_y = Y_OFFSET - 2 - (lane_idx + 1) * PERIOD_LANE_HEIGHT
+        ttype = task_type.get(tid, "NEUTRAL")
+        label_color = TASK_LABEL_COLOR.get(ttype, "black")
+
+        # baseline
+        ax.plot([0, max_time if max_time else 48], [lane_y, lane_y],
+                color=label_color, linewidth=1, alpha=0.5, zorder=2)
+
+        # release-time arrows: bold black, arrowhead pointing down onto the
+        # baseline, very visible
+        t = 0
+        limit = max_time if max_time else 48
+        while t <= limit:
+            ax.annotate(
+                "",
+                xy=(t, lane_y), xytext=(t, lane_y + PERIOD_LANE_HEIGHT * 0.85),
+                arrowprops=dict(arrowstyle="-|>", color="black",
+                                 linewidth=2.0, mutation_scale=14),
+                zorder=6,
+            )
+            t += period
+
+        ax.text(
+            -1.0, lane_y,
+            f"T{tid} (P={period:g})",
+            ha="right", va="center", fontsize=8, fontweight="bold",
+            color=label_color,
+        )
+
+    total_height = Y_OFFSET + len(core_names) * ROW_HEIGHT
+    ax.set_ylim(-1.5, total_height)
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ylabels)
+    ax.set_xlabel("Time")
+    ax.set_title("Scheduling Gantt Chart")
+
+    ax.set_xlim(-6, max_time)
+    ax.set_xticks(range(0, max_time + 1, 1))
+    ax.tick_params(axis="x", labelsize=7, rotation=90)
+    ax.grid(True, axis="x", linestyle=":", alpha=0.5)
+
+    # Legend based on task types actually present
+    legend_handles = []
+    seen_types = set(task_type.values()) | {"IDLE"}
+    for ttype in ["ANTERIOR", "MALICIOUS", "POSTERIOR", "NEUTRAL", "IDLE"]:
+        if ttype in seen_types:
+            legend_handles.append(
+                mpatches.Patch(
+                    facecolor=COLOR_MAP[ttype],
+                    edgecolor="black" if ttype != "IDLE" else "#999999",
+                    label=ttype.title(),
+                )
+            )
+
+    # AEW window legend entries (only if any attack events were plotted)
+    seen_aew_types = {ev["type"] for ev in aew_windows}
+    for aew_type in ["ANTERIOR", "POSTERIOR"]:
+        if aew_type in seen_aew_types:
+            legend_handles.append(
+                Line2D([0], [0], color=AEW_LINE_COLOR[aew_type],
+                       linestyle="--", linewidth=1.6,
+                       label=f"{aew_type.title()} AEW")
+            )
+
+    legend_handles.append(
+        Line2D([0], [0], color="black", linewidth=2.0, marker="v",
+               markersize=6, linestyle="-", label="Period release")
+    )
+
+    ax.legend(handles=legend_handles, loc="upper center",
+              bbox_to_anchor=(0.5, -0.22), ncol=len(legend_handles))
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved Gantt chart to {out_path}")
+
+
+def main():
+    # Defaults, used when running from an IDE (e.g. Spyder's "Run file",
+    # which does not pass command-line arguments). Edit these paths as
+    # needed, or run from a terminal with:
+    #     python plot_gantt.py <trace.csv> [output.png]
+    default_csv = "gantt_trace.csv"
+    default_out = "gantt_chart.png"
+
+    if len(sys.argv) >= 2:
+        csv_path = sys.argv[1]
+    else:
+        csv_path = default_csv
+        print(f"No CSV path given on the command line, using default: {csv_path}")
+
+    if len(sys.argv) >= 3:
+        out_path = sys.argv[2]
+    else:
+        out_path = default_out
+
+    task_type, task_period, task_aew_value, core_names, schedule, attack_events = parse_trace(csv_path)
+
+    if not core_names:
+        print("No TIME/CORE trace block found in the file.")
+        sys.exit(1)
+
+    plot_gantt(task_type, task_period, task_aew_value, core_names, schedule,
+               attack_events, out_path)
+
+
+if __name__ == "__main__":
+    main()
